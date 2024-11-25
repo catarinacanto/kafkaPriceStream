@@ -66,6 +66,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Create a WaitGroup to manage goroutines
+	var wg sync.WaitGroup
+
 	// Capture shutdown signals
 	go func() {
 		sigChan := make(chan os.Signal, 1)
@@ -81,13 +84,37 @@ func main() {
 		GroupID: "etf-aggregator-group",
 	})
 
-	go consumeETFData(ctx, reader, window5sChan, window1mChan, window1hChan)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		consumeETFData(ctx, reader, window5sChan, window1mChan, window1hChan)
+	}()
 
-	go aggregateETFPrices(ctx, window5sChan, windowSize5s, "5s")
-	go aggregateETFPrices(ctx, window1mChan, windowSize1m, "1m")
-	go aggregateETFPrices(ctx, window1hChan, windowSize1h, "1h")
+	wg.Add(3) // One for each window size
+	go func() {
+		defer wg.Done()
+		aggregateETFPrices(ctx, window5sChan, windowSize5s, "5s")
+	}()
+	go func() {
+		defer wg.Done()
+		aggregateETFPrices(ctx, window1mChan, windowSize1m, "1m")
+	}()
+	go func() {
+		defer wg.Done()
+		aggregateETFPrices(ctx, window1hChan, windowSize1h, "1h")
+	}()
 
-	<-ctx.Done()
+	// Wait for all goroutines to finish before shutting down
+	wg.Wait()
+
+	// Graceful shutdown: Closing Kafka writer
+	log.Println("Shutting down Kafka writer...")
+	if err := writer.Close(); err != nil {
+		log.Printf("Error closing Kafka writer: %v", err)
+	} else {
+		log.Println("Kafka writer closed successfully.")
+	}
+
 	log.Println("Application shutdown complete")
 }
 
@@ -144,6 +171,7 @@ func aggregateETFPrices(ctx context.Context, windowChan <-chan WindowData, inter
 			log.Printf("Context canceled, stopping aggregation for bucket %s", bucket)
 			return
 		case <-ticker.C:
+			mu.Lock()
 			for isin, data := range window {
 				if len(data) == 0 {
 					continue
@@ -156,8 +184,11 @@ func aggregateETFPrices(ctx context.Context, windowChan <-chan WindowData, inter
 
 				delete(window, isin)
 			}
+			mu.Unlock()
 		case wd := <-windowChan:
+			mu.Lock()
 			window[wd.ISIN] = append(window[wd.ISIN], wd.Data)
+			mu.Unlock()
 		}
 	}
 }
@@ -180,9 +211,6 @@ func calculateAverageCourse(data []ETFData, bucket string) AggregatedETFData {
 }
 
 func publishETFMetrics(data AggregatedETFData) {
-	mu.Lock()
-	defer mu.Unlock()
-
 	msg, err := json.Marshal(data)
 	if err != nil {
 		log.Printf("Failed to marshal aggregated etf data: %v", err)
